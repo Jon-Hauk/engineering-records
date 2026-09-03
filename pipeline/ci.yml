@@ -1,0 +1,151 @@
+name: ci
+
+# Every gate that matters runs here, where it cannot be skipped with
+# --no-verify. The pre-commit hooks are a fast local mirror of this.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Dependencies rot even when you do not touch them. A weekly scan catches
+    # a CVE published against a pinned version you have not changed.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------
+  # Runs every pre-commit hook against the whole repo, on Linux.
+  #
+  # This exists because the hooks were configured and then never executed for
+  # a day - four version pins pointed at tags that do not exist, and nobody
+  # found out until someone finally installed them. A commit with no hooks
+  # installed looks exactly like a commit where every hook passed, so local
+  # hooks cannot be trusted to prove anything.
+  #
+  # This job is the positive signal: if the hook config is broken, or someone
+  # committed with --no-verify, the build fails.
+  # See docs/incidents/INC-2026-08-11-devsecops-gates-never-executed.md
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: --all-files
+        env:
+          # PSScriptAnalyzer is a local hook that needs Windows PowerShell and
+          # cannot run on this runner. It is enforced on the developer machine
+          # instead. Every other hook runs here.
+          SKIP: psscriptanalyzer
+
+  # ---------------------------------------------------------------
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (CPU torch — no GPU on runners)
+        working-directory: genai
+        run: uv sync --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Ruff
+        working-directory: genai
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Mypy
+        working-directory: genai
+        run: uv run mypy src
+      - name: Pytest
+        working-directory: genai
+        run: uv run pytest -q
+
+  # ---------------------------------------------------------------
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gitleaks needs full history to scan past commits
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------
+  sast:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - run: semgrep ci --config p/python --config p/secrets --config p/github-actions
+
+  # ---------------------------------------------------------------
+  dependencies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy (vulnerabilities in dependencies)
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          format: sarif
+          output: trivy.sarif
+
+      - name: Upload to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+
+  # ---------------------------------------------------------------
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+      # An SBOM you cannot retrieve after the fact is not an SBOM. Keep it
+      # attached to the run so you can answer "were we exposed to X?" later.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cyclonedx.json
+          retention-days: 90
+
+  # ---------------------------------------------------------------
+  # The ZTA policy is code, so it gets tested like code. A change that would
+  # let a phone SSH into a server fails here instead of in your living room.
+  zta-policy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'schedule' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tailnet ACL + run its access tests
+        env:
+          TS_API_KEY: ${{ secrets.TS_API_KEY }}
+        run: |
+          if [ -z "$TS_API_KEY" ]; then
+            echo "::warning::TS_API_KEY not set — skipping live ACL validation."
+            exit 0
+          fi
+          curl -sSf -u "${TS_API_KEY}:" \
+            -H "Content-Type: application/hujson" \
+            --data-binary @zta-soho/policy/acl.hujson \
+            https://api.tailscale.com/api/v2/tailnet/-/acl/validate

@@ -1,0 +1,16 @@
+# gitleaks allowlist -- one fingerprint per line.
+#
+# Only FALSE POSITIVES belong here. A real secret gets gitignored and rotated,
+# never allowlisted. If you are tempted to add one, that is the signal to stop.
+#
+# --- curl-auth-user in the ACL-validate CI job -------------------------------
+# CI passes a Tailscale API token as the HTTP basic-auth USERNAME with an empty
+# password. The value is a GitHub Actions secret expansion, not a literal, and
+# the step exits early when that secret is unset. The curl-auth-user rule
+# cannot distinguish a variable reference from a value.
+#
+# Re-verified 2026-08-26 against HEAD of this repository. Carried over from the
+# monorepo allowlist, re-pathed: the workflow lives at pipeline/ci.yml here
+# rather than .github/workflows/, so it is documentation and never executes.
+# Do not paste a curl -u example into this file; this file is itself scanned.
+pipeline/ci.yml:curl-auth-user:148

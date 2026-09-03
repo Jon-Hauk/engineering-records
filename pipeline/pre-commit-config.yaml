@@ -1,0 +1,86 @@
+# Shift-left gate. These run on every commit, before code exists anywhere
+# but your disk. Install once:  uv tool install pre-commit && pre-commit install
+#
+# Bypass is possible (--no-verify) and that is fine — the same checks run in CI
+# where they cannot be skipped. Local hooks exist for speed, not enforcement.
+repos:
+  # --- hygiene ---------------------------------------------------------
+  # detect-private-key, invoked as a module instead of through the console
+  # script pre-commit generates for it. Smart App Control blocks that unsigned
+  # .exe shim (WinError 4551) while permitting the venv's python.exe, so the
+  # hook could not run at all - and a security hook that cannot run is worse
+  # than one that fails, because it reports nothing and looks fine.
+  #
+  # Identical upstream code, same pinned version as the block below, reached by
+  # a path the policy allows. Do not fold this back in without checking that
+  # the shim is no longer blocked.
+  - repo: local
+    hooks:
+      - id: detect-private-key
+        name: detect private key
+        entry: python -m pre_commit_hooks.detect_private_key
+        language: python
+        additional_dependencies: ["pre-commit-hooks==6.0.0"]
+        types: [text]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=5000]   # model weights must never enter git
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      # no-commit-to-branch is deliberately absent. It blocks commits to main,
+      # which only makes sense with a PR flow to land them instead. This is a
+      # solo repo with no such flow yet - the hook would fail every commit,
+      # you would pass --no-verify every time, and the habit of bypassing the
+      # gate is worse than the gate is worth. Add it back alongside PRs.
+
+  # --- secrets ---------------------------------------------------------
+  # The highest-value hook here. A leaked key is the single most common way
+  # a hobby repo becomes an incident.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  # --- python ----------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # --- SAST ------------------------------------------------------------
+  # Semgrep is deliberately NOT a local hook. It ships no Windows build - its
+  # pre-commit hook tries to compile from source and aborts - so on this
+  # machine it can only fail. It runs in CI on ubuntu-latest instead, where
+  # it works and where it cannot be bypassed. See .github/workflows/ci.yml.
+  #
+  # A gate that always fails gets disabled, and then you have no gate.
+
+  # --- powershell ------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: psscriptanalyzer
+        name: PSScriptAnalyzer
+        # -ExecutionPolicy Bypass is required: the hook runs in a context
+        # where the default policy blocks loading the module's own scripts,
+        # so Invoke-ScriptAnalyzer resolves but cannot load.
+        #
+        # Scoped to our script directories on purpose, so the hook does not
+        # walk vendored or virtualenv trees on every commit.
+        # -Path takes one string, not an array, so the paths are looped.
+        entry: >-
+          powershell -NoProfile -ExecutionPolicy Bypass -Command
+          "Import-Module PSScriptAnalyzer;
+          $r = @('zta-soho/scripts','genai/scripts','fieldkit') | ForEach-Object {
+          Invoke-ScriptAnalyzer -Path $_ -Recurse -Severity Error };
+          if ($r) { $r | Format-Table RuleName,ScriptName,Line -AutoSize; exit 1 }; exit 0"
+        language: system
+        files: \.ps1$
+        pass_filenames: false
