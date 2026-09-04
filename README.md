@@ -62,3 +62,16 @@ hook config is not broken.
 | **mypy** | Type errors | `strict = true`. |
 | **PSScriptAnalyzer** | PowerShell defects | The lab's scripts are real code and get real linting. |
 | **ACL validation** | Broken network policy | A change that would let a phone SSH into a server fails the build. |
+
+## License
+
+[CC BY 4.0](LICENSE) — Creative Commons Attribution 4.0 International.
+
+This repo is writing, not software, so a code licence fits it badly: Apache and
+MIT are built around distributing and modifying source, and say nothing useful
+about quoting a decision record. CC BY is the normal choice for documents. It
+means anyone may share or adapt this, including commercially, provided they
+credit it.
+
+The code repos it describes are Apache-2.0 instead: `fieldkit`, `localagent`,
+`win-sec-snapshot`.
