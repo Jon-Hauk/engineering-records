@@ -141,9 +141,20 @@ jobs:
         env:
           TS_API_KEY: ${{ secrets.TS_API_KEY }}
         run: |
+          # Fails closed. This used to `exit 0` on a missing secret with only a
+          # ::warning:: to show for it, so the job reported success in six
+          # seconds having validated nothing, on every run it ever had. That is
+          # INC-2026-08-11 again: a control that did not run is
+          # indistinguishable from a control that passed.
           if [ -z "$TS_API_KEY" ]; then
-            echo "::warning::TS_API_KEY not set — skipping live ACL validation."
-            exit 0
+            # The one legitimate exemption, named rather than silent.
+            # Dependabot PRs cannot read Actions secrets at all.
+            if [ "${{ github.actor }}" = "dependabot[bot]" ]; then
+              echo "::notice::Dependabot PR — no access to Actions secrets."
+              exit 0
+            fi
+            echo "::error::TS_API_KEY is not set, so the tailnet ACL was not validated. Add it as a repository secret; do not silence this."
+            exit 1
           fi
           curl -sSf -u "${TS_API_KEY}:" \
             -H "Content-Type: application/hujson" \

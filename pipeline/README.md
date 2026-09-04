@@ -20,7 +20,13 @@ It is here to be read.
 | `sast` | semgrep against `p/python`, `p/secrets`, `p/github-actions`. |
 | `dependencies` | Trivy filesystem scan, CRITICAL/HIGH fail the build, SARIF uploaded to code scanning. |
 | `sbom` | CycloneDX SBOM, retained 90 days as a run artifact. |
-| `zta-policy` | Validates the network policy against the Tailscale API. Skips with a warning when no key is present, rather than passing silently. |
+| `zta-policy` | Validates the network policy against the Tailscale API. **Fails closed** when no key is present — it used to `exit 0` with a warning, which meant it reported success having validated nothing on every run it ever had. See [READING-A-PIPELINE](READING-A-PIPELINE.md). |
+
+## Reading it
+
+[`READING-A-PIPELINE.md`](READING-A-PIPELINE.md) — five ways a pipeline reports
+success while doing nothing, each one a mistake made here first, ordered by how
+cheap the check is.
 
 ## Notes worth stealing
 
