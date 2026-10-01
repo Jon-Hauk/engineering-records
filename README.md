@@ -2,8 +2,9 @@
 
 How I decide, and how I write up my own failures.
 
-Three things live here: the architecture decision records for a private
-security lab, the incident reports for controls that broke, and the CI
+Four things live here: the architecture decision records for a private
+security lab, the incident reports for controls that broke, write-ups of lab
+runs, and the CI
 pipeline that enforces the gates those records argue for.
 
 `pipeline/ci.yml` is a **reference copy, not a live workflow here** -- it
@@ -32,6 +33,7 @@ is now the reason later ADRs carry per-claim evidence markers.
 |---|---|
 | [`adr/`](adr/) | Architecture decision records. Why the security choices are what they are. |
 | [`incidents/`](incidents/) | What broke, why, and what changed as a result. |
+| [`labs/`](labs/) | Lab runs: what was tested, observed, and proven, and what was not. |
 | [`pipeline/`](pipeline/) | The CI workflow and pre-commit config those decisions produced. Reference copies; they do not run in this repo. |
 
 ## Two rings
@@ -73,5 +75,5 @@ about quoting a decision record. CC BY is the normal choice for documents. It
 means anyone may share or adapt this, including commercially, provided they
 credit it.
 
-The code repos it describes are Apache-2.0 instead: `fieldkit`, `localagent`,
-`win-sec-snapshot`.
+The code repos it describes are Apache-2.0 instead: `fieldkit`, `automation-kits`,
+`localagent`, `win-sec-snapshot`.
