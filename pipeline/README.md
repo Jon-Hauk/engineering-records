@@ -15,12 +15,18 @@ It is here to be read.
 | Job | Purpose |
 |---|---|
 | `pre-commit` | Runs every hook against the whole repo. Exists because hooks were configured and then never executed — see [INC-2026-08-11](../incidents/INC-2026-08-11-devsecops-gates-never-executed.md). |
-| `lint-and-test` | `ruff check`, `ruff format --check`, `mypy`, `pytest`, under `uv`. |
+| `lint-and-test` | `ruff check`, `ruff format --check`, `mypy`, `pytest`, under `uv`, as a matrix over each Python project. |
+| `ci-manifest` | Fails when a tracked top-level directory is not registered in the coverage manifest, or a manifest entry claims a job that does not exist. Stops "covered" from being asserted in a comment. |
+| `fieldkit-linux` | The Linux diagnostic kit on the standard library only: lint, types, a Python 3.8 parse contract, and its unit tests. |
+| `fieldkit-containers` | The container checks against a real Docker daemon and a deliberately misconfigured workload, on 3.8 and 3.12. Fixtures never open a socket; this does. |
+| `powershell` | PSScriptAnalyzer over every tracked `.ps1`, plus the PowerShell test suites, on a Windows runner. |
 | `secrets` | gitleaks with `fetch-depth: 0`, so it scans history rather than the diff. |
 | `sast` | semgrep against `p/python`, `p/secrets`, `p/github-actions`. |
 | `dependencies` | Trivy filesystem scan, CRITICAL/HIGH fail the build, SARIF uploaded to code scanning. |
 | `sbom` | CycloneDX SBOM, retained 90 days as a run artifact. |
 | `zta-policy` | Validates the network policy against the Tailscale API. **Fails closed** when no key is present — it used to `exit 0` with a warning, which meant it reported success having validated nothing on every run it ever had. See [READING-A-PIPELINE](READING-A-PIPELINE.md). |
+| `zta-drift` | Fetches the live tailnet policy and fails on any difference from the repo copy, so "the repo is the policy" is checked on every run instead of asserted. |
+| `package-collector`, `collector-smoke` | Build the Windows review collector's container image, assert the payload is in the layer, then run it and check the header's promises hold. |
 
 ## Reading it
 
@@ -40,6 +46,10 @@ after the fact is not an SBOM.
 do not touch them. A CVE published against a pinned version you have not
 changed is invisible to a push-triggered pipeline.
 
-**`SKIP: psscriptanalyzer` in CI** — that hook needs Windows PowerShell and is
-enforced on the developer machine instead. Recorded rather than silently
-dropped.
+**`SKIP: psscriptanalyzer` in the `pre-commit` job** — that hook needs Windows
+PowerShell and the job runs on Linux. It was once enforced only on one
+developer machine; since 2026-09-10 the `powershell` job enforces it on a
+Windows runner. The skip is recorded rather than silently dropped.
+
+**The copy here is redacted.** Host names in comments and in one guard are
+replaced with placeholders; the header of `ci.yml` says which.

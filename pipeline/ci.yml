@@ -1,3 +1,8 @@
+# Published copy (engineering-records/pipeline), taken from the private monorepo's
+# .github/workflows/ci.yml at 573156d. Host names are replaced with placeholders
+# (<lab-node>, <workstation>, <host-a>, <host-b>); nothing else is changed.
+# It is here to be read, not run: the paths it builds exist only in the monorepo.
+
 name: ci
 
 # Every gate that matters runs here, where it cannot be skipped with
@@ -10,6 +15,18 @@ on:
     # Dependencies rot even when you do not touch them. A weekly scan catches
     # a CVE published against a pinned version you have not changed.
     - cron: "0 6 * * 1"
+
+# Cancel a run when a newer commit supersedes it. Rapid pushes were leaving
+# three full matrices grinding through work whose answer no longer mattered.
+# Keyed per-ref so each PR cancels only itself.
+#
+# main is deliberately EXEMPT. Merging several PRs in a row would otherwise
+# cancel main's own builds, which costs two things that matter more than the
+# saved minutes: the record of whether main is actually green, and the cache
+# save that only happens when a run finishes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -30,50 +47,434 @@ jobs:
   pre-commit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - uses: pre-commit/action@v3.0.1
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
         with:
           extra_args: --all-files
         env:
           # PSScriptAnalyzer is a local hook that needs Windows PowerShell and
           # cannot run on this runner. It is enforced on the developer machine
           # instead. Every other hook runs here.
-          SKIP: psscriptanalyzer
+          # no-commit-to-branch: on a push event actions/checkout creates a
+          # real local `main`, so the hook would fail every main build for a
+          # commit that has already landed. It guards the local commit, not
+          # the CI run.
+          SKIP: psscriptanalyzer,no-commit-to-branch
 
   # ---------------------------------------------------------------
+  # Every Python project with its own lock gets the same four gates. This was a
+  # single hardcoded `working-directory: genai`, so win-sec-snapshot shipped
+  # with a pyproject, a lock and nine tests that CI never once executed - the
+  # same never-ran-gate class as INC-2026-08-11, just arrived at by growth
+  # rather than by breakage. Adding a project here is one `include` entry; the
+  # cost of forgetting is that its tests silently do not run, so the list is
+  # deliberately short and explicit rather than a glob.
   lint-and-test:
+    # The check context is what the main ruleset requires by exact string.
+    # Without a name, GitHub derives it from every matrix value - the genai
+    # leg reported as "lint-and-test (genai, --extra-index-url https://...)",
+    # so changing the index URL would have renamed the check, and a required
+    # check that never reports blocks every PR while looking like CI is hung.
+    # Naming it by project alone makes the context stable across matrix edits.
+    # If you rename this, update the ruleset in the same change:
+    #   gh api repos/Jon-Hauk/claude-projects/rulesets/22866596
+    name: lint-and-test (${{ matrix.project }})
     runs-on: ubuntu-latest
+    strategy:
+      # One project's failure must not cancel the other's run. Two red jobs are
+      # two pieces of information; one red and one cancelled is one.
+      fail-fast: false
+      matrix:
+        include:
+          - project: genai
+            # Meant to get CPU torch (no GPU on the runners), but it does NOT:
+            # `uv sync` installs exactly what uv.lock pins, and the lock pins
+            # the CUDA build, so CI downloads ~3 GB of nvidia-* wheels anyway
+            # (seen 2026-10-10: nvidia-cudnn-cu12 in the Sync log). Left as is
+            # so the sync behaves exactly as before; the disk step below is
+            # what keeps that download fitting on the runner.
+            sync_args: "--extra-index-url https://download.pytorch.org/whl/cpu"
+          - project: win-sec-snapshot
+            sync_args: ""
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # On 2026-10-10 the genai Sync failed twice on PR #63 with "No space left
+      # on device" while unpacking nvidia-cudnn-cu12 into the uv cache: the
+      # runner image no longer has room for the CUDA wheels the lock pins (see
+      # sync_args above). Every PR was blocked on this required check. Remove
+      # preinstalled toolchains this job never touches, before the cache is
+      # restored. A plain run step, so there is no unpinned action to add.
+      - name: Free runner disk
+        if: matrix.project == 'genai'
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
-      - name: Sync (CPU torch — no GPU on runners)
-        working-directory: genai
-        run: uv sync --extra-index-url https://download.pytorch.org/whl/cpu
+          # Keyed per project. A shared key had the two matrix legs overwriting
+          # each other's saves - genai's torch download and win-sec-snapshot's
+          # handful of wheels are not the same cache and must not share a slot.
+          # The dependency glob narrows the hash to the lock that leg actually
+          # syncs, so touching one project no longer invalidates the other.
+          #
+          # Note this suffix change forces one cold miss on genai's first run;
+          # that is the intended cost. Bump the suffix again if a restored
+          # cache ever looks implausibly small (it was stuck at 73KB once).
+          cache-suffix: v3-${{ matrix.project }}
+          cache-dependency-glob: ${{ matrix.project }}/uv.lock
+      - name: Sync
+        working-directory: ${{ matrix.project }}
+        run: uv sync ${{ matrix.sync_args }}
       - name: Ruff
-        working-directory: genai
+        working-directory: ${{ matrix.project }}
         run: |
           uv run ruff check .
           uv run ruff format --check .
+      # Measured 2026-08-30: mypy was 63s, the slowest step in this job - more
+      # than the dependency sync it sits behind. mypy's incremental cache makes
+      # that mostly disappear, but only if the cache survives between runs.
+      # Keyed on the lock plus the sources it actually analyses, so a real code
+      # change invalidates it and a docs-only change does not.
+      - name: Restore mypy cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ matrix.project }}/.mypy_cache
+          key: mypy-${{ runner.os }}-${{ matrix.project }}-${{ hashFiles(format('{0}/uv.lock', matrix.project)) }}-${{ hashFiles(format('{0}/src/**/*.py', matrix.project)) }}
+          restore-keys: |
+            mypy-${{ runner.os }}-${{ matrix.project }}-${{ hashFiles(format('{0}/uv.lock', matrix.project)) }}-
+            mypy-${{ runner.os }}-${{ matrix.project }}-
       - name: Mypy
-        working-directory: genai
+        working-directory: ${{ matrix.project }}
         run: uv run mypy src
       - name: Pytest
-        working-directory: genai
+        working-directory: ${{ matrix.project }}
         run: uv run pytest -q
+
+  # ---------------------------------------------------------------
+  # The meta-gate: asserts that the other gates cover what they claim to.
+  #
+  # Every other job in this file checks the code. This one checks the file.
+  # Three times now a control has passed while silently not covering something
+  # - hooks that never ran, a matrix that named one directory while two
+  # projects had tests, a PSScriptAnalyzer path list missing half the tracked
+  # scripts. Each was fixed on its own, and the fixes did not compose into
+  # anything that would catch the next one, because the scope of a control was
+  # only ever written in a comment.
+  #
+  # ci/projects.yml states the scope; this fails the build when the statement
+  # stops being true. A new tracked top-level directory fails CI until someone
+  # registers it - as a covered project or as a gap with a reason. Silence is
+  # the one option removed.
+  # Named for what it checks. It was `coverage` until 2026-09-11, and an
+  # outside reader took that for a test-coverage percentage gate, which it
+  # has never been. A control whose name promises more than it does is the
+  # polite form of the never-ran gate. Renaming a job renames its required
+  # check; the main ruleset was updated in the same change.
+  ci-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      # The validator reads `git ls-files`, so the checkout above is its input.
+      # PyYAML comes in as an ephemeral tool dependency rather than a repo one:
+      # this script is CI scaffolding and must not add a dependency to any
+      # project it is auditing.
+      - name: Validate CI coverage manifest
+        run: uv tool run --with pyyaml==6.0.3 python ci/validate_coverage.py
+
+  # ---------------------------------------------------------------
+  # fieldkit's Linux port gets its own lane rather than a `lint-and-test`
+  # matrix entry, because it fails all three of that job's assumptions: it has
+  # no lock for `uv sync`, no `src/` layout for `mypy src`, and it uses
+  # `unittest` rather than pytest. Forcing it into the matrix would mean giving
+  # it a pyproject and a lock - which contradicts the thing the tool is for.
+  #
+  # The contract (fieldkit/AGENTS.md) is that it runs on a client's server
+  # having installed NOTHING: Python 3, standard library, no pip, no venv. So
+  # the package is never installed here either. Tests bootstrap their own
+  # sys.path, and the linters run as ephemeral `uv tool run` binaries that
+  # never enter the project.
+  #
+  # It had a full 131-test suite that CI had never once executed. The first run
+  # on Linux found a real failure - the port's own 3.8 syntax guard scanning
+  # test files that use 3.9+ syntax - which is exactly the never-ran-gate class
+  # this workflow keeps rediscovering. See INC-2026-08-11.
+  fieldkit-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      # Versions are pinned inline because this project has no lock to pin them
+      # for it. ruff tracks the pre-commit rev in .pre-commit-config.yaml -
+      # keep the two in step, or a commit that passes locally fails here.
+      - name: Ruff
+        working-directory: fieldkit/linux
+        run: |
+          uv tool run ruff@0.16.6 check .
+          uv tool run ruff@0.16.6 format --check .
+
+      - name: Mypy
+        working-directory: fieldkit/linux
+        run: uv tool run mypy@2.3.1 fieldkit_linux
+
+      # `-t tests` because tests/ has no __init__.py; each test file inserts the
+      # project root on sys.path itself, so nothing needs installing or PYTHONPATH.
+      - name: Unittest
+        working-directory: fieldkit/linux
+        run: python -m unittest discover -s tests -t tests -v
+
+      # The dependency-free premise is the whole product. A single `import
+      # requests` makes the tool undeployable on the machines it exists to
+      # diagnose, and nothing else in CI would notice - the import would
+      # resolve fine on a runner that has it. Checked against the interpreter's
+      # own stdlib list rather than a hand-maintained allowlist, which is the
+      # same reason the 3.8 guard walks the package instead of listing files.
+      - name: Assert the shipped tool is standard-library only
+        working-directory: fieldkit/linux
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+
+          root = pathlib.Path(".")
+          sources = sorted(root.joinpath("fieldkit_linux").rglob("*.py"))
+          sources.append(root / "fieldkit-linux")
+          if len(sources) < 15:
+              sys.exit(f"::error::source walk found only {len(sources)} files; the check is not looking where it thinks it is")
+
+          local = {"fieldkit_linux"}
+          offenders = []
+          for source in sources:
+              tree = ast.parse(source.read_text(), filename=str(source))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      names = [a.name.split(".")[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom):
+                      # level > 0 is a relative import; it cannot be third-party.
+                      if node.level:
+                          continue
+                      names = [(node.module or "").split(".")[0]]
+                  else:
+                      continue
+                  for name in names:
+                      if name and name not in local and name not in sys.stdlib_module_names:
+                          offenders.append(f"{source}:{node.lineno}: {name}")
+
+          if offenders:
+              print("::error::fieldkit/linux must import only the standard library")
+              for offender in offenders:
+                  print(f"  {offender}")
+              sys.exit(1)
+          print(f"{len(sources)} shipped files, standard library only.")
+          PY
+
+  # ---------------------------------------------------------------
+  # The container posture checks, run against a real daemon.
+  #
+  # `fieldkit-linux` above proves the container section parses, lints and
+  # passes its fixtures. None of that touches a Docker socket. The proof that
+  # the six workload checks fire on a live daemon was done once, by hand, on
+  # <lab-node> (fieldkit/linux/evidence/container-posture.md, 2026-09-09) and
+  # pasted into the evidence file - which is exactly the shape of claim this
+  # workflow exists to replace. A transcript proves the code worked on the day
+  # it was pasted; a gate proves it works on the commit being merged.
+  #
+  # The hosted runner is a fair stand-in for an unhardened client host: a
+  # rootful daemon, the runner user in the docker group, no userns-remap. The
+  # script stands up one deliberately misconfigured container, asserts every
+  # workload check names its condition, tears it down and asserts the host
+  # returns to baseline to the digit. It creates and removes only what it
+  # names, so it is safe to run anywhere with a socket - which is the point:
+  # the same file is what <lab-node> runs.
+  #
+  # Two interpreters, because the kit's contract is "Python 3.8+, standard
+  # library, nothing installed" and until now its 3.8 support was a syntax
+  # guard that had never executed the code. 3.12 is what <lab-node> ran by hand.
+  fieldkit-containers:
+    name: fieldkit-containers (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Prove the workload checks against a live daemon
+        env:
+          PYTHON: python
+          OUT: ${{ runner.temp }}/fieldkit-live
+        run: bash fieldkit/linux/tests/live/container-workload.sh
+      # The three console captures are the evidence; the comparison the script
+      # makes is on them. Print them so a green run can be read, not only
+      # trusted.
+      - name: Show the three runs
+        if: always()
+        run: |
+          for run in baseline workload after; do
+            f="${{ runner.temp }}/fieldkit-live/$run.txt"
+            echo "::group::$run"; [ -f "$f" ] && cat "$f" || echo "(not produced)"; echo "::endgroup::"
+          done
+
+  # ---------------------------------------------------------------
+  # PowerShell linting, on the only OS that can run it.
+  #
+  # PSScriptAnalyzer was a local pre-commit hook and nothing else, so it was
+  # enforced on exactly one machine - and <lab-node>, which commits here from Linux,
+  # could not run it at all. `automation-kits/` made that untenable: those
+  # scripts are handed to CLIENTS to run on their own machines, so the one
+  # place unlinted PowerShell actually leaves the building was the one place no
+  # gate opened it.
+  #
+  # This job DISCOVERS its inputs with `git ls-files` rather than listing
+  # directories. The hook listed directories and drifted twice: it named three
+  # while governance/ and scripts/ also held tracked scripts (2026-09-01), and
+  # by 2026-09-09 it named five while tracked PowerShell lived in nine - so
+  # ts-path-proof, win-sec-snapshot, packaging and automation-kits had never
+  # been opened. A list of directories is a claim that goes stale; a query is
+  # not. The file-count floor is the negative control on the query itself.
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pinned to the version installed on <workstation>, so a commit that passes the
+      # local hook cannot fail here on a rule the two versions disagree about.
+      # Bump both together or not at all.
+      - name: Install PSScriptAnalyzer
+        shell: powershell
+        run: Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Analyze every tracked PowerShell file
+        shell: powershell
+        run: |
+          Import-Module PSScriptAnalyzer
+          $files = @(git ls-files '*.ps1' '*.psm1' '*.psd1')
+          if ($files.Count -lt 15) {
+            Write-Output "::error::found only $($files.Count) tracked PowerShell files; the query is not looking where it thinks it is"
+            exit 1
+          }
+          Write-Output "$($files.Count) tracked PowerShell files"
+          $findings = $files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Severity Error }
+          if ($findings) {
+            $findings | Format-Table RuleName,ScriptName,Line,Message -AutoSize
+            Write-Output "::error::PSScriptAnalyzer reported $(@($findings).Count) Error-severity finding(s)"
+            exit 1
+          }
+          Write-Output "No Error-severity findings."
+
+      - name: Install pinned Pester for M365 gates
+        shell: powershell
+        run: Install-Module Pester -RequiredVersion 3.4.0 -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Test M365 safety gates without a tenant
+        shell: powershell
+        run: |
+          & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File fieldkit/tests/Test-M365Gates.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Enforce M365 read-only and credential boundaries
+        shell: powershell
+        run: |
+          & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ci/Test-M365Boundary.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test Entra lab guards without a tenant
+        shell: powershell
+        run: |
+          & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File labs/entra-identity/tests/Test-EntraLabScaffold.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test M365 posture without a tenant
+        shell: powershell
+        run: |
+          & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File fieldkit/tests/Test-M365Posture.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test engagement preparation without a tenant
+        shell: powershell
+        run: |
+          & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File labs/entra-identity/tests/Test-PrepareEngagement.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   # ---------------------------------------------------------------
   secrets:
     runs-on: ubuntu-latest
+    # On a pull_request event gitleaks-action enumerates the PR's commits via
+    # GET /repos/{o}/{r}/pulls/{n}/commits, which needs pull-requests: read.
+    # The top-level `contents: read` alone makes that 403 with "Resource not
+    # accessible by integration". Push events take a different code path and
+    # never needed it, so this only surfaced on the repo's first PR.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0   # gitleaks needs full history to scan past commits
-      - uses: gitleaks/gitleaks-action@v2
+
+      # shared/ is a junction into the sibling drop that both agents write to.
+      # It holds the approval-queue ADRs, budget, client notes - none of it is
+      # portfolio, and none of it has ever been committed (verified across every
+      # ref, 2026-09-10). Until now that rested on one .gitignore line, which
+      # is advice: `git add -f`, or any tool that resolves the junction, walks
+      # straight past it and nothing goes red. This is the positive control.
+      #
+      # History is checked too, not only the index, because a path that was
+      # committed and then deleted is still on the remote. fetch-depth: 0 above
+      # is what makes `git log --all` mean something here.
+      #
+      # The whitespace check is the `termux ` incident (CLAUDE.md): a directory
+      # with a trailing space broke every git command locally AND was silently
+      # skipped by gitleaks, because a file the scanner cannot open is a file
+      # the scanner cannot clear. Windows git refuses such paths; Linux git,
+      # which is what runs here, does not - so this is the runner that can
+      # actually catch one arriving from another clone.
+      #
+      # The count floor is the negative control on the query itself, the same
+      # shape as the PowerShell job: ls-files returning nothing would otherwise
+      # pass every check.
+      - name: Refuse shared/ and unscannable paths
+        run: |
+          set -euo pipefail
+          tracked=$(git ls-files | wc -l)
+          if [ "$tracked" -lt 100 ]; then
+            echo "::error::git ls-files returned only $tracked paths; the query is broken"
+            exit 1
+          fi
+          fail=0
+          bad=$(git ls-files -z | tr '\0' '\n' | grep -E '^shared/' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::shared/ is tracked. It is a junction into a sibling drop and must never enter git."
+            echo "$bad"; fail=1
+          fi
+          hist=$(git log --all --name-only --format= -- 'shared/*' | grep -E '^shared/' | sort -u || true)
+          if [ -n "$hist" ]; then
+            echo "::error::shared/ appears in git history. Rewriting history is the only fix; do it deliberately."
+            echo "$hist"; fail=1
+          fi
+          ws=$(git ls-files -z | tr '\0' '\n' | grep -E '(^|/) | (/|$)' || true)
+          if [ -n "$ws" ]; then
+            echo "::error::tracked path has a leading or trailing space in a segment; gitleaks cannot open it and silently skips it (CLAUDE.md, the 'termux ' incident)"
+            echo "$ws"; fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "$tracked tracked paths; nothing under shared/, nothing under shared/ in history, no edge-whitespace segments."
+
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -81,9 +482,15 @@ jobs:
   sast:
     runs-on: ubuntu-latest
     container:
-      image: semgrep/semgrep
+      # Pinned to the digest `latest` resolved to on 2026-09-10. Every action
+      # in this file is SHA-pinned; this was the one floating tag, so the SAST
+      # job ran whatever Docker Hub served that morning. Dependabot does not
+      # track `container:` images (only Dockerfiles), so this pin is bumped by
+      # hand: `curl -s 'https://hub.docker.com/v2/repositories/semgrep/semgrep/tags/?page_size=10&ordering=last_updated'`
+      # and replace both the tag and the digest together.
+      image: semgrep/semgrep:1.176.0@sha256:12672acdb0949e19f9f6a4c2b288edd0b404f268f0ca7738a2c06f372f50362e
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: semgrep ci --config p/python --config p/secrets --config p/github-actions
 
   # ---------------------------------------------------------------
@@ -92,38 +499,119 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      # upload-sarif reads the workflow run it is reporting against. Without
+      # actions: read that call 403s and the upload step fails even when the
+      # SARIF itself is valid, so the findings never reach code scanning.
+      actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Trivy (vulnerabilities in dependencies)
-        uses: aquasecurity/trivy-action@0.29.0
+      - name: Trivy (report, all severities)
+        # Tags on this action are v-prefixed. `0.29.0` has never existed, so
+        # this job failed at "Set up job" on every run it has ever had - the
+        # same never-executed-gate class of bug as INC-2026-08-11.
+        #
+        # Pinned to a commit SHA, not a tag. A tag can be silently repointed by
+        # the action owner, and trivy-action is itself one of the actions named
+        # in the compromise that motivates semgrep's mutable-action-tag rule.
+        # Renovate/Dependabot can bump this; the comment is what makes the pin
+        # readable. SHA below is tag v0.36.0.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scanners: vuln,secret,misconfig
-          severity: CRITICAL,HIGH
-          exit-code: "1"
+          trivyignores: .trivyignore
+          # Every severity, deliberately: see it all here, gate on CRITICAL/HIGH
+          # below. A finding you cannot see is a finding you cannot triage.
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"        # informational only; never fails the build
+          format: table
+          output: ""            # empty means stdout, so findings are readable
+
+      # Produces the artifact for code scanning. exit-code 0 because this step
+      # must not gate: trivy-action rewrites `severity` to all severities
+      # whenever format is sarif ("Building SARIF report with all severities"),
+      # so a SARIF step with exit-code 1 fails on LOW and UNKNOWN findings no
+      # matter what severity is set to. That is how the single original step
+      # came to enforce a threshold nobody chose.
+      - name: Trivy (SARIF artifact for code scanning)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          trivyignores: .trivyignore
+          exit-code: "0"
           format: sarif
           output: trivy.sarif
 
+      # Non-fatal on purpose. Code scanning on a PRIVATE repo needs GitHub
+      # Advanced Security, which is not enabled here, so this step cannot
+      # succeed no matter how the permissions are set. Kept rather than deleted
+      # because it starts working unchanged if the repo goes public or GHAS is
+      # turned on - but it must not be what turns the build red.
       - name: Upload to code scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: trivy.sarif
+
+      # The actual gate, and the only step here that can fail the job. Uses a
+      # non-SARIF format specifically so that `severity` is honoured.
+      - name: Trivy (gate on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          trivyignores: .trivyignore
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          format: table
+          output: ""
+
+      # The semgrep image in the sast job is pinned by digest, and Dependabot
+      # cannot see `container:` images, so nothing else in this repo would ever
+      # notice it going stale. A SAST job that stays green for a year on a
+      # ruleset from last spring is the same silent-gate failure as everything
+      # else in this file, arrived at slowly. This runs with the weekly rot
+      # scan and fails once the pinned tag is older than the window, which
+      # forces the bump instead of reminding about it. Bump: see the comment
+      # on the sast job.
+      - name: Semgrep pin age (schedule only)
+        if: github.event_name == 'schedule'
+        run: |
+          tag=$(grep -oE 'image: semgrep/semgrep:[0-9.]+' .github/workflows/ci.yml | head -1 | cut -d: -f3)
+          if [ -z "$tag" ]; then
+            echo "::error::could not read the semgrep tag from ci.yml; the pin has changed shape and this check is not looking at it"
+            exit 1
+          fi
+          python3 - "$tag" <<'PY'
+          import datetime, json, sys, urllib.request
+          tag = sys.argv[1]
+          url = f"https://hub.docker.com/v2/repositories/semgrep/semgrep/tags/{tag}"
+          info = json.load(urllib.request.urlopen(url, timeout=30))
+          pushed = datetime.datetime.fromisoformat(info["last_updated"].replace("Z", "+00:00"))
+          age = (datetime.datetime.now(datetime.timezone.utc) - pushed).days
+          limit = 45
+          print(f"semgrep/semgrep:{tag} was pushed {age} days ago (limit {limit})")
+          if age > limit:
+              print(f"::error::the pinned semgrep image is {age} days old. Bump the tag and digest together (comment on the sast job says how).")
+              sys.exit(1)
+          PY
 
   # ---------------------------------------------------------------
   sbom:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Generate CycloneDX SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           format: cyclonedx-json
           output-file: sbom.cyclonedx.json
       # An SBOM you cannot retrieve after the fact is not an SBOM. Keep it
       # attached to the run so you can answer "were we exposed to X?" later.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom
           path: sbom.cyclonedx.json
@@ -136,27 +624,235 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'schedule' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Validate tailnet ACL + run its access tests
         env:
           TS_API_KEY: ${{ secrets.TS_API_KEY }}
         run: |
-          # Fails closed. This used to `exit 0` on a missing secret with only a
-          # ::warning:: to show for it, so the job reported success in six
-          # seconds having validated nothing, on every run it ever had. That is
-          # INC-2026-08-11 again: a control that did not run is
-          # indistinguishable from a control that passed.
+          # Fails closed. This step used to `exit 0` on a missing secret, with
+          # only a ::warning:: to show for it - so the job reported success in
+          # six seconds having validated nothing, on every run it ever had.
+          # `gh secret list` was empty the whole time: the ACL has never once
+          # been checked here. That is INC-2026-08-11 exactly - a control that
+          # did not run is indistinguishable from a control that passed - and
+          # it sat directly under a comment claiming a change that would let a
+          # phone SSH into a server fails here.
+          #
+          # Cost of failing closed: the build goes red when the Tailscale key
+          # is absent or expired, which is the intended signal, not a defect.
+          # Key rotation is tracked separately. The secret was first set
+          # 2026-09-07 with a 90-day access token, so the rotate-by date is
+          # 2026-12-06. A rotation date that fires early is one people learn
+          # to ignore, so it is corrected here rather than left approximate.
           if [ -z "$TS_API_KEY" ]; then
-            # The one legitimate exemption, named rather than silent.
-            # Dependabot PRs cannot read Actions secrets at all.
+            # The one legitimate exemption. Dependabot pull requests run with
+            # their own secret store and cannot read Actions secrets at all, so
+            # failing them here would turn every dependency PR red for a reason
+            # the author cannot fix. Narrow, and named rather than silent.
             if [ "${{ github.actor }}" = "dependabot[bot]" ]; then
-              echo "::notice::Dependabot PR — no access to Actions secrets."
+              echo "::notice::Dependabot PR - no access to Actions secrets. ACL validation skipped by design."
               exit 0
             fi
             echo "::error::TS_API_KEY is not set, so the tailnet ACL was not validated. Add it as a repository secret; do not silence this."
             exit 1
           fi
-          curl -sSf -u "${TS_API_KEY}:" \
-            -H "Content-Type: application/hujson" \
-            --data-binary @zta-soho/policy/acl.hujson \
-            https://api.tailscale.com/api/v2/tailnet/-/acl/validate
+          # This used to be `curl -sSf` with no output captured. It failed the
+          # step correctly, but -s meant a success printed NOTHING: the log
+          # recorded a green tick and no evidence of what Tailscale actually
+          # said. For this job specifically that is the wrong default - its
+          # entire history is a green tick that meant nothing - so the status
+          # code and the response body are both recorded now, on pass and on
+          # fail alike. The gate is unchanged; only the record improves.
+          #
+          # -f is dropped deliberately in favour of an explicit status check.
+          # With -f, curl exits before the body is readable, so a 401 or 403
+          # would fail the step without ever showing which one it was. Network
+          # failures still fail the step: a failing command substitution trips
+          # the shell's -e.
+          # Deliberately ONE long line, unwrapped. gitleaks' curl-auth-user
+          # rule cannot tell a secret expansion from a literal, and its inline
+          # `gitleaks:allow` must sit on the same line as the finding - which a
+          # backslash continuation makes impossible. The alternative is a
+          # fingerprint in .gitleaksignore, but fingerprints embed the LINE
+          # NUMBER, so every edit above this point silently invalidates them.
+          # That has now happened three times. Content-anchored beats
+          # position-anchored; readability loses this one on purpose.
+          http_code=$(curl -sS -u "${TS_API_KEY}:" -H "Content-Type: application/hujson" --data-binary @zta-soho/policy/acl.hujson -o acl-validate.out -w '%{http_code}' https://api.tailscale.com/api/v2/tailnet/-/acl/validate) # gitleaks:allow
+          echo "ACL validate returned HTTP ${http_code}"
+          echo "--- response body ---"
+          cat acl-validate.out
+          echo ""
+          echo "---------------------"
+          if [ "$http_code" != "200" ]; then
+            # 401 means the wrong key type was pasted - a tskey-auth device key
+            # instead of a tskey-api access token. 403 means the token is valid
+            # but lacks the scope. Naming both here saves the next person the
+            # lookup, because the two look identical from the job summary.
+            echo "::error::ACL validation failed with HTTP ${http_code}. 401 = wrong key type (tskey-auth instead of tskey-api); 403 = valid token, insufficient scope. Response body is above."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------
+  # Packages the $275 client collector as a tagged image, so the artifact we
+  # send is traceable to a commit rather than to whatever was on a desktop.
+  #
+  # The build context is a TRACKED directory. The first draft of this job built
+  # from shared/portfolio-starters/09-05/Dockerfile with a context of
+  # shared/sendable. shared/ is a junction into a sibling drop and is ignored
+  # (.gitignore line 41), so actions/checkout never received either path: the
+  # job would have failed at -f on every run, reporting a dockerfile read error
+  # that looks like a Docker problem and is not one.
+  package-collector:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'schedule' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Assert the context is really in the checkout before Docker is involved,
+      # so a path regression names itself instead of arriving as a build error.
+      - name: Verify build context is tracked
+        run: |
+          for f in Dockerfile Collect-WindowsReview.ps1; do
+            p="packaging/windows-review-collector/$f"
+            if [ ! -f "$p" ]; then
+              echo "::error::$p is not in the checkout - is it still only under shared/, which is gitignored?"
+              exit 1
+            fi
+          done
+
+      - name: Build collector image
+        run: docker build -t windows-review-collector:ci packaging/windows-review-collector
+
+      # The image is a delivery envelope, not a runnable scanner: no ENTRYPOINT,
+      # and the .ps1 executes on the client's Windows host. So the only thing
+      # worth asserting is that the payload actually made it into the layer.
+      - name: Verify the collector is in the image
+        run: |
+          docker run --rm --entrypoint /bin/sh windows-review-collector:ci -c \
+            'test -s /work/Collect-WindowsReview.ps1 && head -1 /work/Collect-WindowsReview.ps1'
+
+  # ---------------------------------------------------------------
+  # Runs the client collector and checks what it promises the client.
+  #
+  # Until 2026-09-11 the one artifact that leaves the building was linted and
+  # packaged but never executed by CI. PSScriptAnalyzer proves syntax and
+  # style; it cannot tell you the script exits 0, writes the file it says it
+  # writes, or that the header's claims - read-only, ASCII only, no lab
+  # hostnames - are still true after the next edit. Each of those is a promise
+  # made in a comment, and the repo has already learned three times what a
+  # promise made in a comment is worth. This step makes the machine check them.
+  #
+  # windows-latest runs it elevated, so the admin-only sections are exercised
+  # too. It is a smoke test, not a test suite: it proves the script runs and
+  # its contract holds, not that every finding is correct.
+  collector-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run the collector
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'review.txt'
+          & powershell -NoProfile -ExecutionPolicy Bypass -File packaging/windows-review-collector/Collect-WindowsReview.ps1 -OutFile $out
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::collector exited $LASTEXITCODE"; exit 1 }
+          if (-not (Test-Path $out)) { Write-Output "::error::collector exited 0 but wrote no file at $out"; exit 1 }
+          Write-Output "collector wrote $((Get-Item $out).Length) bytes"
+
+      - name: Check the output against the header's promises
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'review.txt'
+          $lines = Get-Content $out
+          $fail = 0
+          if ($lines[-1] -ne 'END OF COLLECTOR OUTPUT') { Write-Output "::error::output is truncated - last line is '$($lines[-1])'"; $fail = 1 }
+          if (-not ($lines -contains 'READ_ONLY=yes  CHANGES=none  INSTALL=none')) { Write-Output "::error::the READ_ONLY/CHANGES/INSTALL banner is missing"; $fail = 1 }
+          # "ASCII only" is a promise to a client whose mail gateway may
+          # mangle anything else. Check bytes, not characters.
+          $bytes = [System.IO.File]::ReadAllBytes($out)
+          $high = @($bytes | Where-Object { $_ -gt 127 }).Count
+          if ($high -gt 0) { Write-Output "::error::$high non-ASCII bytes in the output; the header promises ASCII only"; $fail = 1 }
+          # Every FINDING line must have the shape the brief template parses.
+          # The floor is the negative control: a run that emits none would
+          # otherwise pass every shape check.
+          $findings = @($lines | Where-Object { $_ -like 'FINDING *' })
+          if ($findings.Count -lt 10) { Write-Output "::error::only $($findings.Count) FINDING lines; expected at least 10"; $fail = 1 }
+          $bad = @($findings | Where-Object { $_ -notmatch '^FINDING  control=[^ ]+  result=(pass|fail|could-not-read)  evidence=' })
+          if ($bad.Count -gt 0) { Write-Output "::error::$($bad.Count) FINDING line(s) do not match the control/result/evidence shape"; $bad | ForEach-Object { Write-Output "  $_" }; $fail = 1 }
+          Write-Output "$($findings.Count) FINDING lines, $($lines.Count) lines total, $high non-ASCII bytes"
+          exit $fail
+
+      # Two static checks on the shipped source, because they are promises
+      # about the file the client receives, not about one run of it.
+      - name: Check the source against the header's promises
+        shell: powershell
+        run: |
+          $src = 'packaging/windows-review-collector/Collect-WindowsReview.ps1'
+          $text = Get-Content $src -Raw
+          $fail = 0
+          # No lab hostnames. The header used to name them in the sentence
+          # telling you not to ship them, which is how a client learns them.
+          if ($text -match '(?i)<host-a>|<host-b>') { Write-Output "::error::$src names a lab host; it must not"; $fail = 1 }
+          # Read-only means no state-changing cmdlet. Everything the script
+          # legitimately calls with a mutating verb is listed; anything else
+          # with such a verb is a change to the client's machine and fails.
+          $allowed = @('Add-Line', 'Add-Finding', 'New-Object', 'Out-String', 'Write-Host', 'Copy-Item')
+          $verbs = 'Set|New|Remove|Install|Enable|Disable|Start|Stop|Restart|Add|Clear|Invoke|Register|Unregister|Uninstall|Write|Copy|Move|Rename|Out|Update|Reset|Grant|Revoke|Block|Unblock'
+          $calls = [regex]::Matches($text, "(?<![A-Za-z-])($verbs)-[A-Za-z]+") | ForEach-Object { $_.Value } | Sort-Object -Unique
+          $unexpected = @($calls | Where-Object { $allowed -notcontains $_ })
+          if ($unexpected.Count -gt 0) { Write-Output "::error::state-changing cmdlet(s) in a read-only collector: $($unexpected -join ', ')"; $fail = 1 }
+          Write-Output "mutating-verb cmdlets found: $($calls -join ', ')"
+          exit $fail
+
+  # ---------------------------------------------------------------
+  # Is the repo policy the LIVE policy?
+  #
+  # zta-policy above proves acl.hujson is a valid policy. It says nothing about
+  # whether it is the policy the tailnet is running, and for a month it was
+  # not: the live rules were applied from another tree, the repo file said
+  # something else, and every run was green. Validation without drift
+  # detection is a file format check wearing a security control's name.
+  #
+  # This fetches the live policy (the API returns JSON when asked for it),
+  # canonicalises both sides, and fails on any difference. Comments and key
+  # order are not drift. The script has a negative control: an empty or error
+  # body on either side exits 2, never 0.
+  #
+  # NOT in the main ruleset's required checks yet, on purpose. main's policy
+  # is known to lag live until PR #24 (the reconcile) merges, so this job is
+  # red on main and on every PR that carries main's policy - which is the
+  # truth, and it is visible. It is not a warning, because a warning is a
+  # gate that never ran. Add it to the ruleset in the same change that merges
+  # #24; until then a red here on an unrelated PR means "main still drifts",
+  # not "this PR broke something".
+  zta-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Fetch the live policy
+        env:
+          TS_API_KEY: ${{ secrets.TS_API_KEY }}
+        run: |
+          if [ -z "$TS_API_KEY" ]; then
+            if [ "${{ github.actor }}" = "dependabot[bot]" ]; then
+              echo "::notice::Dependabot PR - no access to Actions secrets. Drift check skipped by design."
+              echo "SKIP=1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::error::TS_API_KEY is not set, so drift was not checked. Same rule as zta-policy: do not silence this."
+            exit 1
+          fi
+          # One line for the same gitleaks reason as zta-policy's curl.
+          http_code=$(curl -sS -u "${TS_API_KEY}:" -H "Accept: application/json" -o acl.live.json -w '%{http_code}' https://api.tailscale.com/api/v2/tailnet/-/acl) # gitleaks:allow
+          echo "GET acl returned HTTP ${http_code}, $(wc -c < acl.live.json) bytes"
+          if [ "$http_code" != "200" ]; then
+            echo "::error::could not fetch the live policy (HTTP ${http_code}). 401 = wrong key type; 403 = token lacks policy read scope. Body follows."
+            cat acl.live.json; echo
+            exit 1
+          fi
+
+      - name: Diff live against the repo policy
+        if: env.SKIP != '1'
+        run: uv tool run --with hjson==3.1.0 python zta-soho/scripts/acl_drift.py --live acl.live.json

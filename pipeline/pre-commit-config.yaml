@@ -33,11 +33,18 @@ repos:
       - id: check-toml
       - id: end-of-file-fixer
       - id: trailing-whitespace
-      # no-commit-to-branch is deliberately absent. It blocks commits to main,
-      # which only makes sense with a PR flow to land them instead. This is a
-      # solo repo with no such flow yet - the hook would fail every commit,
-      # you would pass --no-verify every time, and the habit of bypassing the
-      # gate is worse than the gate is worth. Add it back alongside PRs.
+      # no-commit-to-branch was absent until 2026-09-10 on the grounds that
+      # "this is a solo repo with no PR flow yet". There have been 26 PRs since.
+      # It matters more here than in most repos: branch protection is not
+      # available on a private Free-plan repo (the API answers 403 "Upgrade to
+      # GitHub Pro or make this repository public"), so this hook and
+      # release.yml's green-CI check are the only things standing between a
+      # direct commit and main. Three agents commit to this tree; the hook is
+      # what turns "land it on a branch" from a convention into a check.
+      # CI SKIPs it (ci.yml pre-commit job) because checkout creates a real
+      # `main` on push events.
+      - id: no-commit-to-branch
+        args: [--branch, main]
 
   # --- secrets ---------------------------------------------------------
   # The highest-value hook here. A leaked key is the single most common way
@@ -49,7 +56,7 @@ repos:
 
   # --- python ----------------------------------------------------------
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.2
+    rev: v0.16.10
     hooks:
       - id: ruff
         args: [--fix]
@@ -66,20 +73,53 @@ repos:
   # --- powershell ------------------------------------------------------
   - repo: local
     hooks:
+      # The Jetson has no host Python 3.12. Use a pinned multi-arch test
+      # runtime; no host install, packages, or network access during checks.
+      - id: lab-evidence-redaction
+        name: lab evidence redaction
+        language: docker_image
+        entry: >-
+          --network=none --read-only
+          python@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+          python -B scripts/verify_lab_redaction.py
+        files: ^(labs/|scripts/verify_lab_redaction\.py|scripts/tests/test_lab_redaction\.py|\.pre-commit-config\.yaml$)
+        pass_filenames: false
+      - id: lab-evidence-redaction-tests
+        name: lab evidence redaction tests
+        language: docker_image
+        entry: >-
+          --network=none --read-only --tmpfs=/tmp:rw,mode=1777
+          python@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+          python -B -m unittest discover -s scripts/tests -v
+        files: ^(scripts/verify_lab_redaction\.py|scripts/tests/test_lab_redaction\.py|\.pre-commit-config\.yaml$)
+        pass_filenames: false
       - id: psscriptanalyzer
         name: PSScriptAnalyzer
         # -ExecutionPolicy Bypass is required: the hook runs in a context
         # where the default policy blocks loading the module's own scripts,
         # so Invoke-ScriptAnalyzer resolves but cannot load.
         #
-        # Scoped to our script directories on purpose, so the hook does not
-        # walk vendored or virtualenv trees on every commit.
-        # -Path takes one string, not an array, so the paths are looped.
+        # Inputs are DISCOVERED with `git ls-files`, not listed. The list of
+        # directories that used to live here drifted twice: it named three
+        # while governance/ and scripts/ also held tracked scripts
+        # (2026-09-01), and by 2026-09-09 it named five while tracked
+        # PowerShell lived in nine - so ts-path-proof, win-sec-snapshot,
+        # packaging and automation-kits had never once been opened, including
+        # a script that ships to clients. The comment here said
+        # "`git ls-files` is the check" while the code did something else.
+        # It is now the code.
+        #
+        # A list of directories is a claim that goes stale; a query is not.
+        # The count floor is the negative control on the query itself - it
+        # catches ls-files returning nothing, where every file "passes".
+        # Mirrors ci.yml's `powershell` job; keep the two in step.
+        # -Path takes one string, not an array, so the files are looped.
         entry: >-
           powershell -NoProfile -ExecutionPolicy Bypass -Command
           "Import-Module PSScriptAnalyzer;
-          $r = @('zta-soho/scripts','genai/scripts','fieldkit') | ForEach-Object {
-          Invoke-ScriptAnalyzer -Path $_ -Recurse -Severity Error };
+          $f = @(git ls-files '*.ps1' '*.psm1' '*.psd1');
+          if ($f.Count -lt 15) { Write-Output ('only ' + $f.Count + ' tracked PowerShell files; the query is broken'); exit 1 };
+          $r = $f | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Severity Error };
           if ($r) { $r | Format-Table RuleName,ScriptName,Line -AutoSize; exit 1 }; exit 0"
         language: system
         files: \.ps1$
