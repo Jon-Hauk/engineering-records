@@ -7,4 +7,5 @@ review.
 
 | ID | Title | Result | Date |
 |---|---|---|---|
+| [LAB-2026-09-20](LAB-2026-09-20-entra-identity.md) | An Entra lab built as code, and the check that reads it | PASS | 2026-09-20 |
 | [LAB-2026-09-30](LAB-2026-09-30-ids-suricata.md) | One Suricata alert, explained end to end | PASS | 2026-09-30 |
