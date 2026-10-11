@@ -8,6 +8,7 @@ Why the security and workflow choices are what they are.
 | [0005](0005-security-gates-must-be-satisfiable.md) | Security gates must be satisfiable, or they get bypassed | Accepted | 2026-08-11 |
 | [0006](0006-actions-that-spend-money-require-confirmation.md) | Actions that spend money require explicit confirmation | Accepted | 2026-08-10 |
 | [0007](0007-blender-bridge-is-localhost-only.md) | The Blender bridge binds localhost only, with a token, off by default | Accepted | 2026-08-10 |
+| [0009](0009-fail-is-narrow-and-host-scoped.md) | FAIL stays narrow; container findings do not gate the exit code | Accepted | 2026-09-09 |
 
 Gaps in the numbering are ADRs held back with the lab — topology, host
 posture, anything that does not stand alone here. A number is allocated
