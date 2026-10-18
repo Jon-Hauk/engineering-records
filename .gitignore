@@ -1,2 +1,17 @@
 *.pyc
 __pycache__/
+
+# Credentials and raw captures are not publication artifacts.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.pcap
+*.pcapng
+
+# JH 20261018: ADR 8 is never a publication candidate, even redacted.
+**/0008-*
+**/[Aa][Dd][Rr]-0008-*
