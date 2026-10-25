@@ -11,7 +11,3 @@ __pycache__/
 *.pfx
 *.pcap
 *.pcapng
-
-# JH 20261018: ADR 8 is never a publication candidate, even redacted.
-**/0008-*
-**/[Aa][Dd][Rr]-0008-*

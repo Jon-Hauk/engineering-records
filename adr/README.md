@@ -21,11 +21,6 @@ and links into the private policy repository turned into plain references.
 
 [`0000-template.md`](0000-template.md) is the blank.
 
-**Publication boundary:** ADR 8 must never be published, including a redacted
-copy (JH 20261018). The ignore rules cover its usual filenames as a guard
-against accidental addition; they are not a substitute for reviewing content
-and history. Never copy the private ADR directory wholesale into this repo.
-
 ## Verification markers
 
 Claims in later ADRs carry their evidence status, because three
